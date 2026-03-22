@@ -19,6 +19,8 @@ const CENTER_LAT = 17.63314;
 const CENTER_LON = 78.506311;
 const MAX_ZOOM = 19;
 const DEFAULT_ZOOM = 17;
+const BLOCK_LABEL_MIN_ZOOM = 18;
+const CAMPUS_ROUTE_THRESHOLD = 120;
 
 const TILE_LAYERS = {
   satellite: {
@@ -45,7 +47,6 @@ const MREM_PLACE = {
   lon: 78.505966,
 };
 
-// Named campus locations
 const CAMPUS_PLACES = [
   {
     name: "Entrance Gate",
@@ -97,7 +98,6 @@ const CAMPUS_PLACES = [
   },
 ];
 
-// Block polygons
 const APJ_BLOCK_COORDS: [number, number][] = [
   [17.632619, 78.505749],
   [17.632428, 78.505756],
@@ -112,11 +112,285 @@ const SRK_BLOCK_COORDS: [number, number][] = [
   [17.633263, 78.505709],
 ];
 
+// Campus internal path nodes (backbone route)
+const CAMPUS_ROUTE_NODES: [number, number][] = [
+  [17.632525, 78.506805], // 0 – entrance side
+  [17.632784, 78.506799], // 1 – junction B
+  [17.632739, 78.505822], // 2 – junction C
+  [17.63341, 78.505797], // 3 – junction D
+  [17.633439, 78.506837], // 4 – junction E
+  [17.634347, 78.506933], // 5 – exit side
+];
+
+const CAMPUS_ROUTE_EDGES: [number, number][] = [
+  [0, 1],
+  [1, 2],
+  [2, 3],
+  [3, 4],
+  [4, 5],
+  [1, 4],
+];
+
+// Campus bounding rectangle
+const CAMPUS_RECT: [number, number][] = [
+  [17.632509, 78.506869],
+  [17.632414, 78.505447],
+  [17.634656, 78.505377],
+  [17.634488, 78.506983],
+];
+
+// ── helpers ─────────────────────────────────────────────────────────────────
+
 function polygonCenter(coords: [number, number][]): [number, number] {
   const lat = coords.reduce((s, c) => s + c[0], 0) / coords.length;
   const lon = coords.reduce((s, c) => s + c[1], 0) / coords.length;
   return [lat, lon];
 }
+
+function haversine(a: [number, number], b: [number, number]): number {
+  const R = 6371000;
+  const dLat = ((b[0] - a[0]) * Math.PI) / 180;
+  const dLon = ((b[1] - a[1]) * Math.PI) / 180;
+  const x =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((a[0] * Math.PI) / 180) *
+      Math.cos((b[0] * Math.PI) / 180) *
+      Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.asin(Math.sqrt(x));
+}
+
+function computeRouteDistance(coords: [number, number][]): number {
+  let total = 0;
+  for (let i = 1; i < coords.length; i++) {
+    total += haversine(coords[i - 1], coords[i]);
+  }
+  return total;
+}
+
+function isPointInCampusRect(pt: [number, number]): boolean {
+  const lats = CAMPUS_RECT.map((c) => c[0]);
+  const lons = CAMPUS_RECT.map((c) => c[1]);
+  const minLat = Math.min(...lats);
+  const maxLat = Math.max(...lats);
+  const minLon = Math.min(...lons);
+  const maxLon = Math.max(...lons);
+  return (
+    pt[0] >= minLat && pt[0] <= maxLat && pt[1] >= minLon && pt[1] <= maxLon
+  );
+}
+
+// Closest point on a line segment to pt
+function closestPointOnSegment(
+  pt: [number, number],
+  a: [number, number],
+  b: [number, number],
+): { point: [number, number]; t: number } {
+  const dx = b[0] - a[0];
+  const dy = b[1] - a[1];
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq === 0) return { point: a, t: 0 };
+  const t = Math.max(
+    0,
+    Math.min(1, ((pt[0] - a[0]) * dx + (pt[1] - a[1]) * dy) / lenSq),
+  );
+  return { point: [a[0] + t * dx, a[1] + t * dy], t };
+}
+
+function nearestEdgePoint(pt: [number, number]): {
+  point: [number, number];
+  edgeA: number;
+  edgeB: number;
+  t: number;
+  dist: number;
+} {
+  let best = {
+    point: CAMPUS_ROUTE_NODES[0] as [number, number],
+    edgeA: 0,
+    edgeB: 1,
+    t: 0,
+    dist: Number.POSITIVE_INFINITY,
+  };
+  for (const [a, b] of CAMPUS_ROUTE_EDGES) {
+    const { point, t } = closestPointOnSegment(
+      pt,
+      CAMPUS_ROUTE_NODES[a],
+      CAMPUS_ROUTE_NODES[b],
+    );
+    const d = haversine(pt, point);
+    if (d < best.dist) best = { point, edgeA: a, edgeB: b, t, dist: d };
+  }
+  return best;
+}
+
+function bearingDeg(from: [number, number], to: [number, number]): number {
+  const dLon = ((to[1] - from[1]) * Math.PI) / 180;
+  const lat1 = (from[0] * Math.PI) / 180;
+  const lat2 = (to[0] * Math.PI) / 180;
+  const y = Math.sin(dLon) * Math.cos(lat2);
+  const x =
+    Math.cos(lat1) * Math.sin(lat2) -
+    Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLon);
+  return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+}
+
+// Fetch OSRM walking route – returns [lat, lon][] or null
+async function fetchOsrmRoute(
+  start: [number, number],
+  dest: [number, number],
+): Promise<[number, number][] | null> {
+  try {
+    const url = `https://router.project-osrm.org/route/v1/foot/${start[1]},${start[0]};${dest[1]},${dest[0]}?overview=full&geometries=geojson`;
+    const res = await fetch(url);
+    const data = await res.json();
+    if (!data.routes || data.routes.length === 0) return null;
+    return data.routes[0].geometry.coordinates.map(
+      ([lon, lat]: [number, number]) => [lat, lon] as [number, number],
+    );
+  } catch {
+    return null;
+  }
+}
+
+// Fetch Mapbox walking route – returns [lat, lon][] or null
+async function fetchMapboxRoute(
+  start: [number, number],
+  dest: [number, number],
+): Promise<[number, number][] | null> {
+  try {
+    const MAPBOX_TOKEN =
+      "pk.eyJ1IjoibWFwYm94IiwiYSI6ImNpejY4NXVycTA2emYycXBndHRqcmZ3N3gifQ.rJcFIG214AriISLbB6B5aw";
+    const url = `https://api.mapbox.com/directions/v5/mapbox/walking/${start[1]},${start[0]};${dest[1]},${dest[0]}?geometries=geojson&overview=full&access_token=${MAPBOX_TOKEN}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    if (!data.routes || data.routes.length === 0) return null;
+    return data.routes[0].geometry.coordinates.map(
+      ([lon, lat]: [number, number]) => [lat, lon] as [number, number],
+    );
+  } catch {
+    return null;
+  }
+}
+
+// Build campus backbone route between two points using Dijkstra over all edges
+function buildBackboneRoute(
+  startPt: [number, number],
+  destPt: [number, number],
+): [number, number][] {
+  const snapStart = nearestEdgePoint(startPt);
+  const snapDest = nearestEdgePoint(destPt);
+
+  const VIRTUAL_START = CAMPUS_ROUTE_NODES.length; // 6
+  const VIRTUAL_DEST = CAMPUS_ROUTE_NODES.length + 1; // 7
+
+  type AdjEntry = { to: number; dist: number };
+  const adj = new Map<number, AdjEntry[]>();
+  const allNodes = CAMPUS_ROUTE_NODES.map((_, i) => i);
+  allNodes.push(VIRTUAL_START, VIRTUAL_DEST);
+  for (const n of allNodes) adj.set(n, []);
+
+  // Original edges (bidirectional)
+  for (const [a, b] of CAMPUS_ROUTE_EDGES) {
+    const d = haversine(CAMPUS_ROUTE_NODES[a], CAMPUS_ROUTE_NODES[b]);
+    adj.get(a)!.push({ to: b, dist: d });
+    adj.get(b)!.push({ to: a, dist: d });
+  }
+
+  // Virtual start connects to both endpoints of its edge
+  const dSA = haversine(snapStart.point, CAMPUS_ROUTE_NODES[snapStart.edgeA]);
+  const dSB = haversine(snapStart.point, CAMPUS_ROUTE_NODES[snapStart.edgeB]);
+  adj.get(VIRTUAL_START)!.push({ to: snapStart.edgeA, dist: dSA });
+  adj.get(VIRTUAL_START)!.push({ to: snapStart.edgeB, dist: dSB });
+  adj.get(snapStart.edgeA)!.push({ to: VIRTUAL_START, dist: dSA });
+  adj.get(snapStart.edgeB)!.push({ to: VIRTUAL_START, dist: dSB });
+
+  // Virtual dest connects to both endpoints of its edge
+  const dDA = haversine(snapDest.point, CAMPUS_ROUTE_NODES[snapDest.edgeA]);
+  const dDB = haversine(snapDest.point, CAMPUS_ROUTE_NODES[snapDest.edgeB]);
+  adj.get(VIRTUAL_DEST)!.push({ to: snapDest.edgeA, dist: dDA });
+  adj.get(VIRTUAL_DEST)!.push({ to: snapDest.edgeB, dist: dDB });
+  adj.get(snapDest.edgeA)!.push({ to: VIRTUAL_DEST, dist: dDA });
+  adj.get(snapDest.edgeB)!.push({ to: VIRTUAL_DEST, dist: dDB });
+
+  // Dijkstra
+  const INF = Number.POSITIVE_INFINITY;
+  const distMap = new Map<number, number>();
+  const prev = new Map<number, number>();
+  const visited = new Set<number>();
+  for (const n of allNodes) distMap.set(n, INF);
+  distMap.set(VIRTUAL_START, 0);
+
+  while (true) {
+    let u = -1;
+    let minD = INF;
+    for (const n of allNodes) {
+      if (!visited.has(n)) {
+        const d = distMap.get(n) ?? INF;
+        if (d < minD) {
+          minD = d;
+          u = n;
+        }
+      }
+    }
+    if (u === -1 || u === VIRTUAL_DEST) break;
+    visited.add(u);
+    for (const { to, dist: d } of adj.get(u) ?? []) {
+      const nd = (distMap.get(u) ?? INF) + d;
+      if (nd < (distMap.get(to) ?? INF)) {
+        distMap.set(to, nd);
+        prev.set(to, u);
+      }
+    }
+  }
+
+  // Reconstruct path of node indices
+  const nodePath: number[] = [];
+  let cur: number | undefined = VIRTUAL_DEST;
+  while (cur !== undefined) {
+    nodePath.unshift(cur);
+    cur = prev.get(cur);
+  }
+
+  const nodeCoord = (n: number): [number, number] => {
+    if (n === VIRTUAL_START) return snapStart.point;
+    if (n === VIRTUAL_DEST) return snapDest.point;
+    return CAMPUS_ROUTE_NODES[n];
+  };
+
+  const route: [number, number][] = [startPt];
+  for (const n of nodePath) route.push(nodeCoord(n));
+  route.push(destPt);
+  return route;
+}
+
+// ── icon factories ───────────────────────────────────────────────────────────
+
+function createArrowDivIcon(heading: number) {
+  return L.divIcon({
+    className: "",
+    html: `<div style="width:24px;height:24px;display:flex;align-items:center;justify-content:center;transform:rotate(${heading}deg)"><div style="width:0;height:0;border-left:9px solid transparent;border-right:9px solid transparent;border-bottom:22px solid #1E73BE;filter:drop-shadow(0 2px 4px rgba(0,0,0,0.5))"></div></div>`,
+    iconSize: [24, 24],
+    iconAnchor: [12, 12],
+  });
+}
+
+function createCustomStartIcon(bearing: number) {
+  return L.divIcon({
+    className: "",
+    html: `
+      <div style="position:relative;width:36px;height:36px;display:flex;align-items:center;justify-content:center">
+        <div style="width:20px;height:20px;background:#E53935;border-radius:50%;border:3px solid white;box-shadow:0 2px 8px rgba(0,0,0,0.6);position:absolute"></div>
+        <div style="position:absolute;transform:rotate(${bearing}deg);transform-origin:center center">
+          <svg width="24" height="24" viewBox="0 0 24 24" style="display:block;margin:auto">
+            <polygon points="12,2 18,18 12,14 6,18" fill="#E53935" stroke="white" stroke-width="1.5"/>
+          </svg>
+        </div>
+      </div>`,
+    iconSize: [36, 36],
+    iconAnchor: [18, 18],
+  });
+}
+
+// ── search ───────────────────────────────────────────────────────────────────
 
 interface SearchResult {
   name: string;
@@ -129,25 +403,11 @@ interface Coords {
   lon: number;
 }
 
-function createArrowDivIcon(heading: number) {
-  return L.divIcon({
-    className: "",
-    html: `
-      <div style="width:24px;height:24px;display:flex;align-items:center;justify-content:center;transform:rotate(${heading}deg)">
-        <div style="width:0;height:0;border-left:9px solid transparent;border-right:9px solid transparent;border-bottom:22px solid #1E73BE;filter:drop-shadow(0 2px 4px rgba(0,0,0,0.5))"></div>
-      </div>`,
-    iconSize: [24, 24],
-    iconAnchor: [12, 12],
-  });
-}
-
 async function searchPlaces(query: string): Promise<SearchResult[]> {
   const results: SearchResult[] = [];
   if (query.length < 2) return results;
-
   const q = query.toLowerCase().trim();
 
-  // 1. Check MREM
   if (
     MREM_PLACE.name.toLowerCase().includes(q) ||
     MREM_PLACE.aliases.some((a) => a.toLowerCase().includes(q))
@@ -159,7 +419,6 @@ async function searchPlaces(query: string): Promise<SearchResult[]> {
     });
   }
 
-  // 2. Check campus places (exact/partial match)
   for (const place of CAMPUS_PLACES) {
     const match =
       place.name.toLowerCase().includes(q) ||
@@ -173,16 +432,12 @@ async function searchPlaces(query: string): Promise<SearchResult[]> {
     }
   }
 
-  // 3. Nominatim with Telangana/India bias
   try {
     const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&format=json&limit=6&countrycodes=in&viewbox=78.0,17.0,79.0,18.5&bounded=0`;
     const res = await fetch(url, { headers: { "Accept-Language": "en" } });
     const data = await res.json();
-
-    // Prioritize Telangana results
     const telangana: SearchResult[] = [];
     const others: SearchResult[] = [];
-
     for (const item of data) {
       const name = item.display_name as string;
       if (
@@ -198,30 +453,31 @@ async function searchPlaces(query: string): Promise<SearchResult[]> {
         lat: Number.parseFloat(item.lat),
         lon: Number.parseFloat(item.lon),
       };
-      if (name.toLowerCase().includes("telangana")) {
-        telangana.push(entry);
-      } else {
-        others.push(entry);
-      }
+      if (name.toLowerCase().includes("telangana")) telangana.push(entry);
+      else others.push(entry);
     }
     results.push(...telangana, ...others);
   } catch {
-    // silently ignore
+    /* silently ignore */
   }
 
   return results;
 }
+
+// ── component ────────────────────────────────────────────────────────────────
 
 export default function App() {
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<any>(null);
   const routeLayerRef = useRef<any>(null);
   const gpsMarkerRef = useRef<any>(null);
-  const mremMarkerRef = useRef<any>(null);
   const watchIdRef = useRef<number | null>(null);
   const prevGpsRef = useRef<Coords | null>(null);
   const currentGpsRef = useRef<Coords | null>(null);
   const tileLayerRef = useRef<any>(null);
+  const apjLabelRef = useRef<any>(null);
+  const srkLabelRef = useRef<any>(null);
+  const customStartMarkerRef = useRef<any>(null);
 
   const [startInput, setStartInput] = useState("");
   const [destInput, setDestInput] = useState("");
@@ -243,14 +499,13 @@ export default function App() {
     coords: Coords;
   } | null>(null);
   const [mapMode, setMapMode] = useState<"satellite" | "default">("satellite");
-
-  // Auto-route when both coords are selected
-  useEffect(() => {
-    if (startCoords && destCoords) {
-      handleStartNavigate();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [startCoords, destCoords]);
+  const [customStartCoords, setCustomStartCoords] = useState<Coords | null>(
+    null,
+  );
+  const [routeInfo, setRouteInfo] = useState<{
+    distanceM: number;
+    timeMin: number;
+  } | null>(null);
 
   // Initialize map
   useEffect(() => {
@@ -278,68 +533,81 @@ export default function App() {
     }).addTo(map);
     tileLayerRef.current = tileLayer;
 
-    // MREM label marker
-    const mremIcon = L.divIcon({
-      className: "",
-      html: `<div style="background:#D84B4B;color:white;font-size:10px;font-weight:700;padding:3px 7px;border-radius:12px;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,0.5);border:2px solid white;font-family:Inter,sans-serif">MREM</div>`,
-      iconSize: [52, 24],
-      iconAnchor: [26, 12],
-    });
-    const mremMarker = L.marker([MREM_PLACE.lat, MREM_PLACE.lon], {
-      icon: mremIcon,
-    })
-      .addTo(map)
-      .bindPopup(
-        `<strong style="font-family:Inter,sans-serif;font-size:12px">${MREM_PLACE.name}</strong>`,
-      );
-    mremMarkerRef.current = mremMarker;
-
-    // Campus place markers
-    for (const place of CAMPUS_PLACES) {
-      const icon = L.divIcon({
-        className: "",
-        html: `<div style="background:rgba(30,115,190,0.9);color:white;font-size:9px;font-weight:600;padding:2px 6px;border-radius:10px;white-space:nowrap;box-shadow:0 1px 6px rgba(0,0,0,0.5);border:1px solid rgba(255,255,255,0.7);font-family:Inter,sans-serif">${place.name}</div>`,
-        iconSize: [null as any, 18],
-        iconAnchor: [0, 9],
-      });
-      L.marker([place.lat, place.lon], { icon })
-        .addTo(map)
-        .bindPopup(
-          `<strong style="font-family:Inter,sans-serif;font-size:11px">${place.name}</strong><br/><span style="font-size:10px;color:#666">${place.lat.toFixed(6)}, ${place.lon.toFixed(6)}</span>`,
-        );
+    // Campus backbone route – thin dashed light-black line (always visible)
+    for (const [a, b] of CAMPUS_ROUTE_EDGES) {
+      L.polyline([CAMPUS_ROUTE_NODES[a], CAMPUS_ROUTE_NODES[b]], {
+        color: "#555555",
+        weight: 2.5,
+        opacity: 0.55,
+        dashArray: "6, 5",
+      }).addTo(map);
     }
 
-    // APJ BLOCK polygon
-    L.polygon(APJ_BLOCK_COORDS, {
-      color: "#FFD700",
-      weight: 2,
-      fillColor: "#FFD700",
-      fillOpacity: 0.15,
-    }).addTo(map);
-
+    // APJ BLOCK label
     const apjCenter = polygonCenter(APJ_BLOCK_COORDS);
-    const apjLabel = L.divIcon({
+    const apjIcon = L.divIcon({
       className: "",
       html: `<div style="color:#FFD700;font-size:13px;font-weight:900;font-family:Inter,sans-serif;text-shadow:0 0 4px #000,0 0 8px #000;white-space:nowrap;letter-spacing:1px">APJ BLOCK</div>`,
       iconAnchor: [36, 8],
     });
-    L.marker(apjCenter, { icon: apjLabel, interactive: false }).addTo(map);
+    apjLabelRef.current = L.marker(apjCenter, {
+      icon: apjIcon,
+      interactive: false,
+    });
 
-    // SRK BLOCK polygon
-    L.polygon(SRK_BLOCK_COORDS, {
-      color: "#FF6B35",
-      weight: 2,
-      fillColor: "#FF6B35",
-      fillOpacity: 0.15,
-    }).addTo(map);
-
+    // SRK BLOCK label
     const srkCenter = polygonCenter(SRK_BLOCK_COORDS);
-    const srkLabel = L.divIcon({
+    const srkIcon = L.divIcon({
       className: "",
       html: `<div style="color:#FF6B35;font-size:13px;font-weight:900;font-family:Inter,sans-serif;text-shadow:0 0 4px #000,0 0 8px #000;white-space:nowrap;letter-spacing:1px">SRK BLOCK</div>`,
       iconAnchor: [40, 8],
     });
-    L.marker(srkCenter, { icon: srkLabel, interactive: false }).addTo(map);
+    srkLabelRef.current = L.marker(srkCenter, {
+      icon: srkIcon,
+      interactive: false,
+    });
+
+    const updateBlockLabels = () => {
+      const zoom = map.getZoom();
+      const apj = apjLabelRef.current;
+      const srk = srkLabelRef.current;
+      if (zoom >= BLOCK_LABEL_MIN_ZOOM) {
+        if (apj && !map.hasLayer(apj)) apj.addTo(map);
+        if (srk && !map.hasLayer(srk)) srk.addTo(map);
+      } else {
+        if (apj && map.hasLayer(apj)) map.removeLayer(apj);
+        if (srk && map.hasLayer(srk)) map.removeLayer(srk);
+      }
+    };
+    map.on("zoomend", updateBlockLabels);
+    updateBlockLabels();
+
+    // Long-press detection
+    let lpTimer: ReturnType<typeof setTimeout> | null = null;
+    const cancelLP = () => {
+      if (lpTimer) {
+        clearTimeout(lpTimer);
+        lpTimer = null;
+      }
+    };
+    const triggerLP = (latlng: any) => {
+      cancelLP();
+      lpTimer = setTimeout(() => {
+        lpTimer = null;
+        window.dispatchEvent(
+          new CustomEvent("map-long-press", {
+            detail: { lat: latlng.lat, lon: latlng.lng },
+          }),
+        );
+      }, 650);
+    };
+
+    map.on("mousedown", (e: any) => triggerLP(e.latlng));
+    map.on("mouseup mousemove", cancelLP);
+    map.on("touchstart", (e: any) => {
+      if (e.originalEvent.touches.length === 1) triggerLP(e.latlng);
+    });
+    map.on("touchend touchmove", cancelLP);
 
     mapRef.current = map;
 
@@ -351,16 +619,50 @@ export default function App() {
     };
   }, []);
 
-  // Swap tile layer when mapMode changes
+  // Long-press handler
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const { lat, lon } = (e as CustomEvent).detail as {
+        lat: number;
+        lon: number;
+      };
+
+      if (customStartMarkerRef.current && mapRef.current) {
+        mapRef.current.removeLayer(customStartMarkerRef.current);
+        customStartMarkerRef.current = null;
+      }
+      if (routeLayerRef.current && mapRef.current) {
+        mapRef.current.removeLayer(routeLayerRef.current);
+        routeLayerRef.current = null;
+      }
+
+      const bearing = destCoords
+        ? bearingDeg([lat, lon], [destCoords.lat, destCoords.lon])
+        : 0;
+
+      if (mapRef.current) {
+        customStartMarkerRef.current = L.marker([lat, lon], {
+          icon: createCustomStartIcon(bearing),
+          zIndexOffset: 900,
+        }).addTo(mapRef.current);
+      }
+
+      setCustomStartCoords({ lat, lon });
+    };
+
+    window.addEventListener("map-long-press", handler);
+    return () => window.removeEventListener("map-long-press", handler);
+  }, [destCoords]);
+
+  // Swap tile layer
   useEffect(() => {
     if (!mapRef.current) return;
     if (tileLayerRef.current) mapRef.current.removeLayer(tileLayerRef.current);
     const config = TILE_LAYERS[mapMode];
-    const newLayer = L.tileLayer(config.url, {
+    tileLayerRef.current = L.tileLayer(config.url, {
       attribution: config.attribution,
       maxZoom: MAX_ZOOM,
     }).addTo(mapRef.current);
-    tileLayerRef.current = newLayer;
   }, [mapMode]);
 
   // GPS tracking
@@ -400,20 +702,32 @@ export default function App() {
   const startDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const destDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const handleStartInput = useCallback((val: string) => {
-    setStartInput(val);
-    setStartCoords(null);
-    if (startDebounceRef.current) clearTimeout(startDebounceRef.current);
-    if (val.length < 2) {
-      setStartSuggestions([]);
-      return;
+  const clearCustomStart = useCallback(() => {
+    if (customStartMarkerRef.current && mapRef.current) {
+      mapRef.current.removeLayer(customStartMarkerRef.current);
+      customStartMarkerRef.current = null;
     }
-    startDebounceRef.current = setTimeout(async () => {
-      const results = await searchPlaces(val);
-      setStartSuggestions(results);
-      setShowStartSugg(results.length > 0);
-    }, 300);
+    setCustomStartCoords(null);
   }, []);
+
+  const handleStartInput = useCallback(
+    (val: string) => {
+      setStartInput(val);
+      setStartCoords(null);
+      if (val !== "") clearCustomStart();
+      if (startDebounceRef.current) clearTimeout(startDebounceRef.current);
+      if (val.length < 2) {
+        setStartSuggestions([]);
+        return;
+      }
+      startDebounceRef.current = setTimeout(async () => {
+        const results = await searchPlaces(val);
+        setStartSuggestions(results);
+        setShowStartSugg(results.length > 0);
+      }, 300);
+    },
+    [clearCustomStart],
+  );
 
   const handleDestInput = useCallback((val: string) => {
     setDestInput(val);
@@ -435,10 +749,14 @@ export default function App() {
       toast.error("Please enter a destination");
       return;
     }
-
     setIsLoading(true);
-    let resolvedStart = startCoords;
-    let startName = startInput.trim() || "My Location";
+    setRouteInfo(null);
+
+    // Resolve start: long-press custom > typed > GPS
+    let resolvedStart: Coords | null = customStartCoords ?? startCoords ?? null;
+    let startName = customStartCoords
+      ? "Custom Location"
+      : startInput.trim() || "My Location";
 
     if (!resolvedStart) {
       if (startInput.trim()) {
@@ -453,12 +771,11 @@ export default function App() {
       } else {
         try {
           const pos = await new Promise<GeolocationPosition>(
-            (resolve, reject) => {
+            (resolve, reject) =>
               navigator.geolocation.getCurrentPosition(resolve, reject, {
                 enableHighAccuracy: true,
                 timeout: 8000,
-              });
-            },
+              }),
           );
           resolvedStart = {
             lat: pos.coords.latitude,
@@ -475,7 +792,6 @@ export default function App() {
 
     let resolvedDest = destCoords;
     let destName = destInput.trim();
-
     if (!resolvedDest) {
       const results = await searchPlaces(destInput);
       if (results.length === 0) {
@@ -487,48 +803,77 @@ export default function App() {
       destName = results[0].name;
     }
 
-    try {
-      const res = await fetch(
-        `https://router.project-osrm.org/route/v1/foot/${resolvedStart.lon},${resolvedStart.lat};${resolvedDest.lon},${resolvedDest.lat}?overview=full&geometries=geojson`,
-      );
-      const data = await res.json();
+    const startPt: [number, number] = [resolvedStart.lat, resolvedStart.lon];
+    const destPt: [number, number] = [resolvedDest.lat, resolvedDest.lon];
 
-      if (!data.routes || data.routes.length === 0) {
-        toast.error("No route found between these locations");
-        setIsLoading(false);
-        return;
+    const startInCampus = isPointInCampusRect(startPt);
+    const destInCampus = isPointInCampusRect(destPt);
+
+    let routeCoords: [number, number][] | null = null;
+
+    if (startInCampus && destInCampus) {
+      // Both inside campus: use backbone walking path
+      routeCoords = buildBackboneRoute(startPt, destPt);
+    } else {
+      // At least one point is outside campus: fetch real walking route from OSRM
+      // Try OSRM and Mapbox in parallel
+      const [osrmRoute, mapboxRoute] = await Promise.all([
+        fetchOsrmRoute(startPt, destPt),
+        fetchMapboxRoute(startPt, destPt),
+      ]);
+
+      if (osrmRoute && osrmRoute.length > 2) {
+        routeCoords = osrmRoute;
+      } else if (mapboxRoute && mapboxRoute.length > 2) {
+        routeCoords = mapboxRoute;
+      } else {
+        // Fallback: backbone route (at least follows campus paths)
+        const nearDest = nearestEdgePoint(destPt);
+        if (nearDest.dist < CAMPUS_ROUTE_THRESHOLD) {
+          routeCoords = buildBackboneRoute(startPt, destPt);
+        } else {
+          toast.error(
+            "No walking route found. Check your connection and try again.",
+          );
+          setIsLoading(false);
+          return;
+        }
       }
-
-      const coords = data.routes[0].geometry.coordinates.map(
-        ([lon, lat]: [number, number]) => [lat, lon] as [number, number],
-      );
-
-      if (mapRef.current) {
-        if (routeLayerRef.current) routeLayerRef.current.remove();
-        const polyline = L.polyline(coords, {
-          color: "#1E73BE",
-          weight: 5,
-          opacity: 0.9,
-        }).addTo(mapRef.current);
-        routeLayerRef.current = polyline;
-        // Smooth animated flyToBounds (1.5s)
-        mapRef.current.flyToBounds(polyline.getBounds(), {
-          padding: [60, 60],
-          duration: 1.5,
-          easeLinearity: 0.25,
-        });
-      }
-
-      setStartPreview({ name: startName, coords: resolvedStart });
-      setDestPreview({ name: destName, coords: resolvedDest });
-      setIsNavigating(true);
-      setPanelCollapsed(true);
-    } catch {
-      toast.error("Failed to fetch route. Please try again.");
     }
 
+    // Compute and set distance/time info
+    if (routeCoords) {
+      const distM = computeRouteDistance(routeCoords);
+      const timeMin = Math.ceil(distM / 83.3); // walking ~5 km/h
+      setRouteInfo({ distanceM: distM, timeMin });
+    }
+
+    if (mapRef.current && routeCoords) {
+      if (routeLayerRef.current) routeLayerRef.current.remove();
+
+      // Draw single deep-blue walking route
+      const polyline = L.polyline(routeCoords, {
+        color: "#1565C0",
+        weight: 6,
+        opacity: 0.95,
+        lineJoin: "round",
+        lineCap: "round",
+      }).addTo(mapRef.current);
+
+      routeLayerRef.current = polyline;
+      mapRef.current.flyToBounds(polyline.getBounds(), {
+        padding: [60, 60],
+        duration: 1.5,
+        easeLinearity: 0.25,
+      });
+    }
+
+    setStartPreview({ name: startName, coords: resolvedStart });
+    setDestPreview({ name: destName, coords: resolvedDest });
+    setIsNavigating(true);
+    setPanelCollapsed(true);
     setIsLoading(false);
-  }, [startCoords, destCoords, startInput, destInput]);
+  }, [startCoords, destCoords, startInput, destInput, customStartCoords]);
 
   const handleMyLocation = useCallback(() => {
     if (currentGpsRef.current && mapRef.current) {
@@ -552,11 +897,9 @@ export default function App() {
 
   const handleZoomIn = useCallback(() => {
     if (!mapRef.current) return;
-    if (mapRef.current.getZoom() >= MAX_ZOOM) {
+    if (mapRef.current.getZoom() >= MAX_ZOOM)
       toast.info(`Maximum zoom reached (level ${MAX_ZOOM})`);
-    } else {
-      mapRef.current.zoomIn();
-    }
+    else mapRef.current.zoomIn();
   }, []);
 
   const handleZoomOut = useCallback(() => {
@@ -569,6 +912,30 @@ export default function App() {
   return (
     <div className="relative w-screen h-screen overflow-hidden">
       <div ref={mapContainerRef} className="map-container" />
+
+      {/* Long-press hint */}
+      {customStartCoords && (
+        <div
+          style={{
+            position: "absolute",
+            bottom: routeInfo ? 80 : 140,
+            left: "50%",
+            transform: "translateX(-50%)",
+            zIndex: 1000,
+            background: "rgba(229,57,53,0.92)",
+            color: "white",
+            fontSize: "11px",
+            fontWeight: 600,
+            padding: "5px 14px",
+            borderRadius: "20px",
+            boxShadow: "0 2px 8px rgba(0,0,0,0.4)",
+            fontFamily: "Inter, sans-serif",
+            whiteSpace: "nowrap",
+          }}
+        >
+          Custom start set – enter destination to route
+        </div>
+      )}
 
       {/* Navigation Panel */}
       <div
@@ -639,10 +1006,20 @@ export default function App() {
                 className="flex items-center gap-2 px-3 py-2 rounded-xl"
                 style={{ background: "#2D3A4B" }}
               >
-                <MapPin size={14} style={{ color: "#1E73BE", flexShrink: 0 }} />
+                <MapPin
+                  size={14}
+                  style={{
+                    color: customStartCoords ? "#E53935" : "#1E73BE",
+                    flexShrink: 0,
+                  }}
+                />
                 <input
                   type="text"
-                  placeholder="Current Location"
+                  placeholder={
+                    customStartCoords
+                      ? "Custom location (long-pressed)"
+                      : "Current Location"
+                  }
                   value={startInput}
                   onChange={(e) => handleStartInput(e.target.value)}
                   onFocus={() =>
@@ -652,13 +1029,14 @@ export default function App() {
                   className="flex-1 bg-transparent text-sm outline-none"
                   style={{ color: "white", fontFamily: "Inter, sans-serif" }}
                 />
-                {startInput && (
+                {(startInput || customStartCoords) && (
                   <button
                     type="button"
                     onMouseDown={() => {
                       setStartInput("");
                       setStartCoords(null);
                       setStartSuggestions([]);
+                      clearCustomStart();
                     }}
                     style={{
                       color: "rgba(255,255,255,0.4)",
@@ -700,6 +1078,7 @@ export default function App() {
                       onMouseDown={() => {
                         setStartInput(s.name);
                         setStartCoords({ lat: s.lat, lon: s.lon });
+                        clearCustomStart();
                         setShowStartSugg(false);
                       }}
                     >
@@ -797,7 +1176,7 @@ export default function App() {
               )}
             </div>
 
-            {/* Search button */}
+            {/* Start Navigation button */}
             <button
               type="button"
               onClick={handleStartNavigate}
@@ -906,7 +1285,7 @@ export default function App() {
         </button>
       </div>
 
-      {/* Map Layer Toggle button */}
+      {/* Map Layer Toggle */}
       <button
         type="button"
         onClick={() =>
@@ -914,7 +1293,7 @@ export default function App() {
         }
         style={{
           position: "absolute",
-          bottom: 88,
+          bottom: routeInfo ? 104 : 88,
           right: 16,
           zIndex: 1000,
           borderRadius: "20px",
@@ -935,13 +1314,13 @@ export default function App() {
           : "\uD83D\uDEF0 Satellite"}
       </button>
 
-      {/* My Location button */}
+      {/* My Location */}
       <button
         type="button"
         onClick={handleMyLocation}
         style={{
           position: "absolute",
-          bottom: 24,
+          bottom: routeInfo ? 40 : 24,
           right: 16,
           zIndex: 1000,
           width: 48,
@@ -959,6 +1338,84 @@ export default function App() {
       >
         <LocateFixed size={20} />
       </button>
+
+      {/* Route Info Bar */}
+      {routeInfo && (
+        <div
+          data-ocid="route.panel"
+          style={{
+            position: "absolute",
+            bottom: 0,
+            left: 0,
+            right: 0,
+            zIndex: 1000,
+            background: "#1B2533",
+            borderTop: "1px solid rgba(255,255,255,0.12)",
+            padding: "12px 20px",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: "28px",
+            fontFamily: "Inter, sans-serif",
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+            }}
+          >
+            <span
+              style={{
+                color: "rgba(255,255,255,0.5)",
+                fontSize: "10px",
+                fontWeight: 600,
+                textTransform: "uppercase",
+                letterSpacing: "0.5px",
+              }}
+            >
+              Distance
+            </span>
+            <span style={{ color: "white", fontSize: "18px", fontWeight: 700 }}>
+              {routeInfo.distanceM >= 1000
+                ? `${(routeInfo.distanceM / 1000).toFixed(1)} km`
+                : `${Math.round(routeInfo.distanceM)} m`}
+            </span>
+          </div>
+          <div
+            style={{
+              width: 1,
+              height: 36,
+              background: "rgba(255,255,255,0.15)",
+            }}
+          />
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+            }}
+          >
+            <span
+              style={{
+                color: "rgba(255,255,255,0.5)",
+                fontSize: "10px",
+                fontWeight: 600,
+                textTransform: "uppercase",
+                letterSpacing: "0.5px",
+              }}
+            >
+              Walking Time
+            </span>
+            <span style={{ color: "white", fontSize: "18px", fontWeight: 700 }}>
+              {routeInfo.timeMin < 60
+                ? `${routeInfo.timeMin} min`
+                : `${Math.floor(routeInfo.timeMin / 60)}h ${routeInfo.timeMin % 60}m`}
+            </span>
+          </div>
+        </div>
+      )}
 
       <style>{`
         @keyframes spin { to { transform: rotate(360deg); } }
