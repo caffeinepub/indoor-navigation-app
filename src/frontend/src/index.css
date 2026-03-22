@@ -1,0 +1,97 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --radius: 0.5rem;
+    /* Dark charcoal theme matching design */
+    --background: 0.18 0.03 233;
+    --foreground: 0.96 0.01 233;
+    --card: 0.27 0.04 233;
+    --card-foreground: 0.96 0.01 233;
+    --popover: 0.27 0.04 233;
+    --popover-foreground: 0.96 0.01 233;
+    --primary: 0.52 0.16 252;
+    --primary-foreground: 0.98 0 0;
+    --secondary: 0.31 0.04 233;
+    --secondary-foreground: 0.96 0.01 233;
+    --muted: 0.31 0.04 233;
+    --muted-foreground: 0.65 0.03 233;
+    --accent: 0.35 0.04 233;
+    --accent-foreground: 0.96 0.01 233;
+    --destructive: 0.57 0.19 25;
+    --destructive-foreground: 0.98 0 0;
+    --border: 0.35 0.04 233;
+    --input: 0.31 0.04 233;
+    --ring: 0.52 0.16 252;
+    --chart-1: 0.52 0.16 252;
+    --chart-2: 0.57 0.19 25;
+    --chart-3: 0.65 0.18 145;
+    --chart-4: 0.7 0.17 55;
+    --chart-5: 0.62 0.15 290;
+    --sidebar: 0.2 0.04 233;
+    --sidebar-foreground: 0.96 0.01 233;
+    --sidebar-primary: 0.52 0.16 252;
+    --sidebar-primary-foreground: 0.98 0 0;
+    --sidebar-accent: 0.31 0.04 233;
+    --sidebar-accent-foreground: 0.96 0.01 233;
+    --sidebar-border: 0.35 0.04 233;
+    --sidebar-ring: 0.52 0.16 252;
+  }
+
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-family: "Inter", sans-serif;
+  }
+}
+
+/* Full screen map */
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+/* Leaflet map container */
+.map-container {
+  width: 100vw;
+  height: 100vh;
+  position: relative;
+}
+
+/* GPS Arrow marker */
+.gps-arrow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+}
+
+.gps-arrow-inner {
+  width: 0;
+  height: 0;
+  border-left: 9px solid transparent;
+  border-right: 9px solid transparent;
+  border-bottom: 22px solid #1e73be;
+  filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.5));
+}
+
+/* Collapsed panel pill animation */
+.nav-panel {
+  transition: all 0.3s ease;
+}
+
+/* Suggestion dropdown */
+.suggestion-item:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
