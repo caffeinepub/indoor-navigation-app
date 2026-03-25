@@ -2,6 +2,7 @@
 declare const L: any;
 
 import { Toaster } from "@/components/ui/sonner";
+import { QrCode, X } from "lucide-react";
 import {
   ChevronDown,
   ChevronUp,
@@ -12,6 +13,7 @@ import {
   Plus,
   Search,
 } from "lucide-react";
+import { QRCodeSVG } from "qrcode.react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
@@ -507,6 +509,7 @@ export default function App() {
     timeMin: number;
   } | null>(null);
 
+  const [showQrModal, setShowQrModal] = useState(false);
   // Initialize map
   useEffect(() => {
     if (!mapContainerRef.current || mapRef.current) return;
@@ -1424,6 +1427,122 @@ export default function App() {
         .map-container { width: 100%; height: 100%; }
         .suggestion-item:hover { background: rgba(255,255,255,0.07) !important; }
       `}</style>
+
+      {/* QR Code Button */}
+      <button
+        type="button"
+        data-ocid="qr.open_modal_button"
+        onClick={() => setShowQrModal(true)}
+        style={{
+          position: "absolute",
+          top: 16,
+          right: 16,
+          zIndex: 1100,
+          width: 40,
+          height: 40,
+          borderRadius: "50%",
+          background: "rgba(20,20,30,0.85)",
+          border: "1.5px solid rgba(255,255,255,0.18)",
+          cursor: "pointer",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          boxShadow: "0 2px 12px rgba(0,0,0,0.45)",
+          backdropFilter: "blur(8px)",
+          color: "white",
+        }}
+        title="Share app QR code"
+      >
+        <QrCode size={20} />
+      </button>
+
+      {/* QR Code Modal */}
+      {showQrModal && (
+        <div
+          data-ocid="qr.modal"
+          role="presentation"
+          onClick={() => setShowQrModal(false)}
+          onKeyDown={(e) => e.key === "Escape" && setShowQrModal(false)}
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 2000,
+            background: "rgba(0,0,0,0.65)",
+            backdropFilter: "blur(6px)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+          }}
+        >
+          <div
+            role="presentation"
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => e.stopPropagation()}
+            style={{
+              background: "rgba(18,18,28,0.97)",
+              border: "1px solid rgba(255,255,255,0.13)",
+              borderRadius: 20,
+              padding: "32px 36px",
+              display: "flex",
+              flexDirection: "column",
+              alignItems: "center",
+              gap: 18,
+              boxShadow: "0 8px 40px rgba(0,0,0,0.7)",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                width: "100%",
+              }}
+            >
+              <span
+                style={{
+                  color: "white",
+                  fontWeight: 700,
+                  fontSize: 16,
+                  letterSpacing: 0.3,
+                }}
+              >
+                Share App
+              </span>
+              <button
+                type="button"
+                data-ocid="qr.close_button"
+                onClick={() => setShowQrModal(false)}
+                style={{
+                  background: "rgba(255,255,255,0.08)",
+                  border: "none",
+                  borderRadius: "50%",
+                  width: 30,
+                  height: 30,
+                  cursor: "pointer",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  color: "white",
+                }}
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div style={{ background: "white", borderRadius: 12, padding: 12 }}>
+              <QRCodeSVG value={window.location.href} size={200} />
+            </div>
+            <span
+              style={{
+                color: "rgba(255,255,255,0.6)",
+                fontSize: 13,
+                textAlign: "center",
+              }}
+            >
+              Scan to open app
+            </span>
+          </div>
+        </div>
+      )}
 
       <Toaster position="top-center" theme="dark" />
     </div>
